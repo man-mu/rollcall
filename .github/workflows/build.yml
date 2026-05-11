@@ -194,11 +194,8 @@ jobs:
 
       - name: Generate source.json (AltStore / SideStore source)
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          TAG="${{ needs.version.outputs.tag }}"
-          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          IPA_SIZE=$(stat -c%s CQUPTRollcall.ipa)
-          REPO="${{ github.repository }}"
+          export DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          export IPA_SIZE=$(stat -c%s CQUPTRollcall.ipa)
 
           python3 -c "
           import json, os
