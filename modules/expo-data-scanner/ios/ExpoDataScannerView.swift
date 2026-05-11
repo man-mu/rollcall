@@ -106,11 +106,9 @@ class ExpoDataScannerView: ExpoView {
     }
   }
 
-  deinit {
-    if let scanner = scanner, scanner.isScanning {
-      scanner.stopScanning()
-    }
-  }
+  // No explicit deinit cleanup: stopScanning() is @MainActor-isolated and
+  // deinit runs in nonisolated context. Cleanup happens in didMoveToWindow
+  // when the view leaves the window hierarchy.
 }
 
 // MARK: - Delegate

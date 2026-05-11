@@ -5,6 +5,8 @@ public class ExpoDataScannerModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ExpoDataScanner")
 
+    // DataScannerViewController is @MainActor-isolated, so this Function must
+    // run on the main queue, not the default JS thread.
     Function("isSupported") { () -> Bool in
       if #available(iOS 16.0, *) {
         return DataScannerViewController.isSupported
@@ -12,6 +14,7 @@ public class ExpoDataScannerModule: Module {
       }
       return false
     }
+    .runOnQueue(.main)
 
     View(ExpoDataScannerView.self) {
       Events("onScan")
