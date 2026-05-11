@@ -5,26 +5,46 @@ import { SymbolWeight, SymbolViewProps } from 'expo-symbols';
 import { ComponentProps } from 'react';
 import { OpaqueColorValue, type StyleProp, type TextStyle } from 'react-native';
 
-type IconMapping = Record<SymbolViewProps['name'], ComponentProps<typeof MaterialIcons>['name']>;
-type IconSymbolName = keyof typeof MAPPING;
+type IconMapping = Record<string, ComponentProps<typeof MaterialIcons>['name']>;
+type IconSymbolName = SymbolViewProps['name'];
 
 /**
- * Add your SF Symbols to Material Icons mappings here.
- * - see Material Icons in the [Icons Directory](https://icons.expo.fyi).
- * - see SF Symbols in the [SF Symbols](https://developer.apple.com/sf-symbols/) app.
+ * SF Symbols → Material Icons mapping for the rollcall app.
+ * Add new entries here whenever a new SF symbol is referenced anywhere.
  */
-const MAPPING = {
+const MAPPING: IconMapping = {
+  // Tabs
+  'checkmark.circle.fill': 'check-circle',
+  'calendar': 'calendar-today',
+  'gearshape.fill': 'settings',
+
+  // Misc
   'house.fill': 'home',
   'paperplane.fill': 'send',
   'chevron.left.forwardslash.chevron.right': 'code',
   'chevron.right': 'chevron-right',
-} as IconMapping;
+  'chevron.down': 'expand-more',
+  'chevron.up': 'expand-less',
 
-/**
- * An icon component that uses native SF Symbols on iOS, and Material Icons on Android and web.
- * This ensures a consistent look across platforms, and optimal resource usage.
- * Icon `name`s are based on SF Symbols and require manual mapping to Material Icons.
- */
+  // Rollcall
+  'qrcode.viewfinder': 'qr-code-scanner',
+  'number.circle': 'looks-one',
+  'location.circle': 'my-location',
+  'questionmark.circle': 'help-outline',
+  'checkmark.circle': 'check-circle-outline',
+  'xmark.circle.fill': 'cancel',
+  'mappin.circle.fill': 'place',
+  'calendar.badge.checkmark': 'event-available',
+  'rectangle.portrait.and.arrow.right': 'logout',
+  'clock': 'schedule',
+  'checkmark.seal.fill': 'verified',
+  'exclamationmark.triangle': 'warning',
+
+  // Network
+  'wifi': 'wifi',
+  'wifi.slash': 'wifi-off',
+};
+
 export function IconSymbol({
   name,
   size = 24,
@@ -37,5 +57,16 @@ export function IconSymbol({
   style?: StyleProp<TextStyle>;
   weight?: SymbolWeight;
 }) {
-  return <MaterialIcons color={color} size={size} name={MAPPING[name]} style={style} />;
+  const mapped = MAPPING[name as string];
+  if (!mapped) {
+    if (__DEV__) console.warn(`[IconSymbol] missing mapping for SF symbol "${String(name)}"`);
+  }
+  return (
+    <MaterialIcons
+      color={color}
+      size={size}
+      name={mapped ?? 'help-outline'}
+      style={style}
+    />
+  );
 }

@@ -1,0 +1,239 @@
+// Mirrors CQUPTRollcall/Services/LMSClient.swift
+//
+// CAS login flow:
+//   1. GET http://lms.tc.cqupt.edu.cn/login                 → 302 to ids
+//   2. GET ids → 200, parse pwdEncryptSalt + execution token
+//   3. POST username/encrypted-password/execution            → 302 (or 200 with kickout dialog)
+//   4. Follow final redirect to obtain session cookie at lms.tc.cqupt.edu.cn
+//
+// We use plain fetch + our own CookieJar instead of axios+@react-native-cookies,
+// so this works on iOS / Android / Web without native modules.
+
+import { encryptPassword } from './crypto';
+import { CookieJar } from './cookieJar';
+import type { Rollcall, RollcallsResponse } from '../models/rollcall';
+
+const LMS_BASE = 'http://lms.tc.cqupt.edu.cn';
+const IDS_BASE = 'https://ids.cqupt.edu.cn';
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+export class LMSError extends Error {
+  constructor(message: string, public kind: 'login' | 'session' | 'checkin' | 'network') {
+    super(message);
+    this.name = 'LMSError';
+  }
+}
+
+export class LMSClient {
+  private jar = new CookieJar();
+
+  // ------------ Public API ------------
+
+  async login(username: string, password: string): Promise<void> {
+    this.jar.clear();
+
+    // Step 1: follow LMS → IDS redirect (no auto-follow, do it manually)
+    const callbackURL = await this.getCallbackURL();
+
+    // Step 2: GET login page, parse salt + execution
+    const loginURL = `${IDS_BASE}/authserver/login?service=${encodeURIComponent(callbackURL)}`;
+    const { salt, execution } = await this.getLoginPageParams(loginURL);
+    if (!execution) throw new LMSError('无法获取 execution token', 'login');
+
+    // Step 3: POST credentials
+    const encPwd = encryptPassword(password, salt);
+    const formBody = new URLSearchParams({
+      username,
+      password: encPwd,
+      captcha: '',
+      _eventId: 'submit',
+      cllt: 'userNameLogin',
+      dllt: 'generalLogin',
+      lt: '',
+      execution,
+    }).toString();
+
+    let res = await this.rawFetch(loginURL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody,
+      redirect: 'manual',
+    });
+
+    let redirectURL: string | null = null;
+    if (res.status === 302) {
+      redirectURL = res.headers.get('Location');
+    } else if (res.status === 200) {
+      const body = await res.text();
+      if (body.includes('踢出会话') || body.includes('kickout')) {
+        const exec2 = extractExecution(body);
+        if (exec2) {
+          const formBody2 = new URLSearchParams({
+            execution: exec2,
+            _eventId: 'continue',
+          }).toString();
+          const res2 = await this.rawFetch(loginURL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formBody2,
+            redirect: 'manual',
+          });
+          if (res2.status === 302) redirectURL = res2.headers.get('Location');
+        }
+      }
+    }
+
+    // Step 4: follow redirect (auto-follow this one to get session cookie set)
+    if (redirectURL) {
+      try {
+        await this.rawFetch(redirectURL, { method: 'GET', redirect: 'follow' });
+      } catch {
+        // ignore — we just need the cookies
+      }
+    }
+
+    if (!this.jar.has('session', LMS_BASE)) {
+      throw new LMSError('未获取到 session cookie', 'login');
+    }
+  }
+
+  async getRollcalls(reLoginIfNeeded: () => Promise<void>): Promise<Rollcall[]> {
+    const url = `${LMS_BASE}/api/radar/rollcalls?api_version=1.1.0`;
+    let res = await this.rawFetch(url);
+    if (res.status === 302 || res.status === 401) {
+      await reLoginIfNeeded();
+      res = await this.rawFetch(url);
+      if (res.status !== 200) return [];
+    }
+    if (res.status !== 200) {
+      throw new LMSError(`getRollcalls HTTP ${res.status}`, 'network');
+    }
+    const json = (await res.json()) as RollcallsResponse;
+    return json.rollcalls ?? [];
+  }
+
+  /** type: "qr" | "number" | "radar" */
+  async doCheckin(
+    rollcallID: number,
+    type: 'qr' | 'number' | 'radar',
+    payload: Record<string, unknown>,
+    deviceId: string,
+  ): Promise<void> {
+    let endpoint: string;
+    switch (type) {
+      case 'qr':     endpoint = `${LMS_BASE}/api/rollcall/${rollcallID}/answer_qr_rollcall`; break;
+      case 'number': endpoint = `${LMS_BASE}/api/rollcall/${rollcallID}/answer_number_rollcall`; break;
+      case 'radar':  endpoint = `${LMS_BASE}/api/rollcall/${rollcallID}/answer`; break;
+      default: throw new LMSError('未知签到类型', 'checkin');
+    }
+
+    const body = { ...payload, deviceId };
+    const res = await this.rawFetch(endpoint, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    let json: any = null;
+    try { json = await res.json(); } catch {}
+
+    if (res.status === 200 && json?.status === 'on_call') {
+      return;
+    }
+
+    const errorMsg =
+      (json && (json.error_code || json.message)) || `请求失败 (${res.status})`;
+    throw new LMSError(errorMsg, 'checkin');
+  }
+
+  // ------------ Internals ------------
+
+  /** Wraps fetch to: inject our Cookie jar, capture Set-Cookie, set UA. */
+  private async rawFetch(url: string, init: RequestInit & { redirect?: 'follow' | 'manual' } = {}): Promise<Response> {
+    const u = new URL(url);
+    const cookieHeader = this.jar.cookieHeader(u.host);
+
+    const headers = new Headers(init.headers ?? {});
+    headers.set('User-Agent', UA);
+    if (cookieHeader) headers.set('Cookie', cookieHeader);
+
+    const res = await fetch(url, { ...init, headers });
+
+    // Capture all Set-Cookie. RN/iOS exposes them via headers.get('set-cookie')
+    // (combined with comma) — but we want each one. Try a few accessors.
+    const sc = collectSetCookie(res);
+    if (sc.length > 0) {
+      this.jar.ingest(sc, u.host);
+    }
+    return res;
+  }
+
+  private async getCallbackURL(): Promise<string> {
+    let currentURL = `${LMS_BASE}/login`;
+    for (let i = 0; i < 2; i++) {
+      const res = await this.rawFetch(currentURL, { redirect: 'manual' });
+      if (res.status < 300 || res.status >= 400) break;
+      const loc = res.headers.get('Location');
+      if (!loc) break;
+      currentURL = absolutize(loc, currentURL);
+    }
+    return currentURL;
+  }
+
+  private async getLoginPageParams(loginURL: string): Promise<{ salt: string; execution: string }> {
+    const res = await this.rawFetch(loginURL);
+    const html = await res.text();
+    return {
+      salt: extractValueByID(html, 'pwdEncryptSalt') ?? '',
+      execution: extractExecution(html) ?? '',
+    };
+  }
+}
+
+// ------------ Helpers ------------
+
+function absolutize(loc: string, base: string): string {
+  try {
+    return new URL(loc, base).toString();
+  } catch {
+    return loc;
+  }
+}
+
+function collectSetCookie(res: Response): string[] {
+  // RN's fetch returns Set-Cookie joined by comma in some platforms — comma is
+  // also valid inside Expires=Thu, 01 Jan ... So splitting on comma is unsafe.
+  // We try multiple paths.
+  const out: string[] = [];
+
+  // 1. Modern Headers#getSetCookie() (Node 18+, available on web Response in 2026)
+  const anyHeaders = res.headers as any;
+  if (typeof anyHeaders.getSetCookie === 'function') {
+    const arr = anyHeaders.getSetCookie();
+    if (Array.isArray(arr)) {
+      for (const c of arr) out.push(c);
+      return out;
+    }
+  }
+
+  // 2. raw header (RN sometimes returns array)
+  const single = res.headers.get('set-cookie');
+  if (typeof single === 'string' && single.length > 0) {
+    out.push(single);
+  }
+
+  return out;
+}
+
+function extractValueByID(html: string, id: string): string | null {
+  const re = new RegExp(`id="${escapeRe(id)}"[^>]*value="([^"]*)"`);
+  return re.exec(html)?.[1] ?? null;
+}
+
+export function extractExecution(html: string): string | null {
+  return /name="execution"[^>]*value="([^"]*)"/.exec(html)?.[1] ?? null;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

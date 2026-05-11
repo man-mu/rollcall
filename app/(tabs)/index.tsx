@@ -1,267 +1,270 @@
 import * as React from 'react';
 import {
-  Platform,
+  ActivityIndicator,
+  Alert,
+  FlatList,
   Pressable,
-  ScrollView,
+  RefreshControl,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
+import { useRouter } from 'expo-router';
 
-import ExpoDataScanner, {
-  ExpoDataScannerView,
-} from '@/modules/expo-data-scanner';
+import { GlassCard, GlassToast } from '@/src/components/Glass';
+import { IconSymbol } from '@/components/ui/icon-symbol';
+import { useAppState } from '@/src/store/appState';
+import {
+  type Rollcall,
+  isAbsent,
+  sourceLabel,
+  sourceSFSymbol,
+  statusLabel,
+} from '@/src/models/rollcall';
+import { getCoords } from '@/src/services/locationData';
 
-const LMS_URL = 'http://lms.tc.cqupt.edu.cn/';
+export default function DashboardScreen() {
+  const router = useRouter();
+  const rollcalls = useAppState(s => s.rollcalls);
+  const todayCourses = useAppState(s => s.todayCourses);
+  const centerConnected = useAppState(s => s.centerConnected);
+  const isPolling = useAppState(s => s.isPolling);
+  const lastPollTime = useAppState(s => s.lastPollTime);
+  const checkinMessage = useAppState(s => s.checkinMessage);
+  const refreshRollcalls = useAppState(s => s.refreshRollcalls);
+  const checkinNumber = useAppState(s => s.checkinNumber);
+  const checkinLocation = useAppState(s => s.checkinLocation);
+  const setCheckinMessage = useAppState(s => s.setCheckinMessage);
 
-type FetchState =
-  | { status: 'idle' }
-  | { status: 'loading' }
-  | { status: 'ok'; httpStatus: number; ms: number; bodyPreview: string }
-  | { status: 'error'; message: string; ms: number };
+  const [refreshing, setRefreshing] = React.useState(false);
 
-export default function SmokeTestScreen() {
-  const [fetchState, setFetchState] = React.useState<FetchState>({ status: 'idle' });
-  const [scanned, setScanned] = React.useState<string | null>(null);
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try { await refreshRollcalls(); } finally { setRefreshing(false); }
+  };
 
-  const [scannerSupported, setScannerSupported] = React.useState(false);
-  React.useEffect(() => {
-    let cancelled = false;
-    ExpoDataScanner.isSupported()
-      .then((v) => { if (!cancelled) setScannerSupported(v); })
-      .catch(() => { if (!cancelled) setScannerSupported(false); });
-    return () => { cancelled = true; };
-  }, []);
+  const onScanGlobal = () => {
+    router.push({ pathname: '/scanner', params: { mode: 'global' } });
+  };
 
-  const liquidGlass = isLiquidGlassAvailable();
-
-  const runFetch = React.useCallback(async () => {
-    setFetchState({ status: 'loading' });
-    const t0 = Date.now();
-    try {
-      // No-redirect (manual) so we can see the original 302.
-      const res = await fetch(LMS_URL, { redirect: 'manual' });
-      const ms = Date.now() - t0;
-      let preview = '';
-      try {
-        preview = (await res.text()).slice(0, 120);
-      } catch {
-        // body may be empty for opaque-redirect
+  const onTapRollcall = (r: Rollcall) => {
+    if (!isAbsent(r)) return;
+    if (r.source === 'qr') {
+      router.push({ pathname: '/scanner', params: { mode: 'rollcall', rollcallID: String(r.rollcall_id) } });
+    } else if (r.source === 'number') {
+      // Use Alert.prompt on iOS, fallback to a simple Alert + manual entry elsewhere.
+      // We use a lightweight cross-platform dialog via Alert.
+      promptForNumber((value) => {
+        if (value) checkinNumber(r.rollcall_id, value);
+      });
+    } else if (r.source === 'radar') {
+      const inst = todayCourses.find(c => {
+        if (c.startMs == null || c.endMs == null) return false;
+        const now = Date.now();
+        return now >= c.startMs - 15 * 60_000 && now <= c.endMs;
+      });
+      if (!inst) {
+        setCheckinMessage('无法确定当前位置');
+        return;
       }
-      setFetchState({
-        status: 'ok',
-        httpStatus: res.status,
-        ms,
-        bodyPreview: preview,
-      });
-    } catch (e: any) {
-      setFetchState({
-        status: 'error',
-        message: e?.message ?? String(e),
-        ms: Date.now() - t0,
-      });
+      const coords = getCoords(inst.location);
+      if (!coords) {
+        setCheckinMessage('未识别的教学楼');
+        return;
+      }
+      checkinLocation(r.rollcall_id, coords.lat, coords.lon);
     }
-  }, []);
+  };
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.title}>CQUPT Rollcall · RN Smoke Test</Text>
-        <Text style={styles.subtitle}>
-          验证 expo-glass-effect / DataScanner / 明文 HTTP / LiveContainer
-        </Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.title}>签到</Text>
+        <Pressable onPress={onScanGlobal} style={styles.scanFab}>
+          <IconSymbol name="qrcode.viewfinder" size={20} color="#fff" />
+          <Text style={styles.scanFabText}>扫一扫</Text>
+        </Pressable>
+      </View>
 
-        {/* === 1. Liquid Glass card === */}
-        <Section heading="① Liquid Glass">
-          <GlassCardOrFallback>
-            <Row label="Platform" value={Platform.OS} />
-            <Row
-              label="iOS 26 Liquid Glass"
-              value={liquidGlass ? '可用 ✓' : '降级 (UIVisualEffectView 或 div)'}
-            />
-            <Row
-              label="DataScanner"
-              value={scannerSupported ? '可用 ✓' : '不支持 (Android/Web/老设备)'}
-            />
-          </GlassCardOrFallback>
-        </Section>
-
-        {/* === 2. LMS HTTP fetch === */}
-        <Section heading="② 明文 HTTP 到 LMS">
-          <Pressable
-            onPress={runFetch}
-            style={({ pressed }) => [
-              styles.button,
-              pressed && styles.buttonPressed,
-              fetchState.status === 'loading' && styles.buttonDisabled,
-            ]}
-            disabled={fetchState.status === 'loading'}>
-            <Text style={styles.buttonText}>
-              {fetchState.status === 'loading' ? '请求中…' : `GET ${LMS_URL}`}
-            </Text>
-          </Pressable>
-          <FetchResult state={fetchState} />
-        </Section>
-
-        {/* === 3. DataScanner === */}
-        <Section heading="③ VisionKit DataScanner">
-          <View style={styles.scannerBox}>
-            {scannerSupported ? (
-              <ExpoDataScannerView
-                enabled
-                style={StyleSheet.absoluteFill}
-                onScan={(e) => setScanned(e.nativeEvent.value)}
+      <FlatList
+        data={rollcalls}
+        keyExtractor={r => String(r.rollcall_id)}
+        contentContainerStyle={styles.listContent}
+        refreshControl={
+          <RefreshControl tintColor="#fff" refreshing={refreshing} onRefresh={onRefresh} />
+        }
+        ListHeaderComponent={
+          <GlassCard borderRadius={14} style={{ marginBottom: 14 }}>
+            <View style={styles.statusRow}>
+              <IconSymbol
+                name={centerConnected ? 'wifi' : 'wifi.slash'}
+                size={18}
+                color={centerConnected ? '#34d399' : '#ff453a'}
               />
-            ) : (
-              <View style={styles.scannerFallback}>
-                <Text style={styles.scannerFallbackText}>
-                  扫码模块在当前平台不可用
+              <Text style={styles.statusText}>
+                {centerConnected ? 'Center 已连接' : 'Center 未连接'}
+              </Text>
+              <View style={{ flex: 1 }} />
+              {isPolling && <ActivityIndicator size="small" color="rgba(235,235,245,0.6)" />}
+              {lastPollTime && (
+                <Text style={styles.timeText}>
+                  {timeAgo(lastPollTime)}
                 </Text>
-                <Text style={styles.scannerFallbackHint}>
-                  Smoke test：iOS 16+ 真机 / LiveContainer 才能验证
-                </Text>
-              </View>
-            )}
+              )}
+            </View>
+          </GlassCard>
+        }
+        ListEmptyComponent={
+          <View style={styles.empty}>
+            <IconSymbol name="checkmark.circle" size={48} color="rgba(235,235,245,0.4)" />
+            <Text style={styles.emptyTitle}>暂无签到任务</Text>
+            <Text style={styles.emptyText}>下拉刷新，或等待轮询</Text>
           </View>
-          <Row
-            label="最近扫码结果"
-            value={scanned ? scanned.slice(0, 48) : '(未扫码)'}
-          />
-        </Section>
-      </ScrollView>
+        }
+        renderItem={({ item }) => (
+          <RollcallRow rollcall={item} onPress={() => onTapRollcall(item)} />
+        )}
+        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+      />
+
+      {checkinMessage && (
+        <View pointerEvents="none" style={styles.toastWrap}>
+          <GlassToast message={checkinMessage} />
+        </View>
+      )}
     </SafeAreaView>
+  );
+}
+
+function RollcallRow({ rollcall, onPress }: { rollcall: Rollcall; onPress: () => void }) {
+  const absent = isAbsent(rollcall);
+  return (
+    <GlassCard borderRadius={14}>
+      <View style={styles.itemRow}>
+        <IconSymbol
+          name={sourceSFSymbol(rollcall.source) as any}
+          size={28}
+          color={absent ? '#ff9f0a' : '#34d399'}
+        />
+        <View style={{ flex: 1, gap: 4 }}>
+          <Text style={styles.courseTitle} numberOfLines={2}>{rollcall.course_title}</Text>
+          <View style={styles.badgeRow}>
+            <View style={styles.badge}>
+              <Text style={styles.badgeText}>{sourceLabel(rollcall.source)}</Text>
+            </View>
+            <Text style={[styles.statusText, { color: absent ? '#ff9f0a' : '#34d399' }]}>
+              {statusLabel(rollcall.status)}
+            </Text>
+          </View>
+        </View>
+        {absent ? (
+          <Pressable onPress={onPress} style={styles.checkinButton}>
+            <Text style={styles.checkinButtonText}>签到</Text>
+          </Pressable>
+        ) : (
+          <IconSymbol name="checkmark.circle.fill" size={24} color="#34d399" />
+        )}
+      </View>
+    </GlassCard>
   );
 }
 
 // -------- helpers --------
 
-function Section({
-  heading,
-  children,
-}: {
-  heading: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionHeading}>{heading}</Text>
-      {children}
-    </View>
-  );
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <View style={styles.row}>
-      <Text style={styles.rowLabel}>{label}</Text>
-      <Text style={styles.rowValue} numberOfLines={2}>
-        {value}
-      </Text>
-    </View>
-  );
-}
-
-function FetchResult({ state }: { state: FetchState }) {
-  if (state.status === 'idle') {
-    return <Text style={styles.muted}>点击按钮发起请求</Text>;
-  }
-  if (state.status === 'loading') {
-    return <Text style={styles.muted}>等待响应…</Text>;
-  }
-  if (state.status === 'ok') {
-    const ok = state.httpStatus >= 200 && state.httpStatus < 400;
-    return (
-      <View>
-        <Text style={[styles.resultText, ok ? styles.ok : styles.warn]}>
-          HTTP {state.httpStatus} · {state.ms} ms
-        </Text>
-        {state.bodyPreview ? (
-          <Text style={styles.preview} numberOfLines={3}>
-            {state.bodyPreview}
-          </Text>
-        ) : null}
-      </View>
+function promptForNumber(cb: (value: string | null) => void) {
+  // Alert.prompt is iOS only. On other platforms we approximate.
+  const RNAlert = require('react-native').Alert as typeof import('react-native').Alert;
+  if (typeof (RNAlert as any).prompt === 'function') {
+    (RNAlert as any).prompt(
+      '输入签到码',
+      '4 位数字',
+      [
+        { text: '取消', onPress: () => cb(null), style: 'cancel' },
+        { text: '确定', onPress: (v: string) => cb(v) },
+      ],
+      'plain-text',
+      '',
+      'number-pad',
     );
+  } else {
+    // Web/Android fallback: use browser prompt or a simple alert flow
+    if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
+      const v = window.prompt('输入签到码 (4 位数字)');
+      cb(v);
+    } else {
+      Alert.alert('暂不支持', '当前平台不支持数字输入弹窗');
+    }
   }
-  return (
-    <Text style={[styles.resultText, styles.err]}>
-      ✗ {state.message} · {state.ms} ms
-    </Text>
-  );
 }
 
-function GlassCardOrFallback({ children }: { children: React.ReactNode }) {
-  // GlassView is safe on all platforms in expo-glass-effect; on web/android it
-  // renders a translucent View, on iOS 26 it's real Liquid Glass, on older iOS
-  // it's UIVisualEffectView with system blur.
-  return (
-    <GlassView style={styles.glassCard} glassEffectStyle="regular">
-      <View style={styles.glassInner}>{children}</View>
-    </GlassView>
-  );
+function timeAgo(ms: number): string {
+  const d = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (d < 60) return `${d}秒前`;
+  if (d < 3600) return `${Math.floor(d / 60)}分钟前`;
+  return `${Math.floor(d / 3600)}小时前`;
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#0b0b0e' },
-  content: { padding: 16, paddingBottom: 48, gap: 18 },
-  title: { color: '#fff', fontSize: 22, fontWeight: '700' },
-  subtitle: { color: '#aaa', fontSize: 13, marginTop: -6 },
-  section: { gap: 8 },
-  sectionHeading: {
-    color: '#ddd',
-    fontSize: 15,
-    fontWeight: '600',
-    marginTop: 8,
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 12,
   },
-  glassCard: {
-    borderRadius: 18,
-    overflow: 'hidden',
-  },
-  glassInner: { padding: 16, gap: 6 },
-  row: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
-  rowLabel: { color: '#ccc', fontSize: 14 },
-  rowValue: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: '500',
-    flexShrink: 1,
-    textAlign: 'right',
-  },
-  button: {
+  title: { color: '#fff', fontSize: 32, fontWeight: '700' },
+  scanFab: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
     backgroundColor: '#3478f6',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 999,
+  },
+  scanFabText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+
+  listContent: { paddingHorizontal: 20, paddingBottom: 120 },
+
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  statusText: { color: '#fff', fontSize: 14 },
+  timeText: { color: 'rgba(235,235,245,0.5)', fontSize: 12 },
+
+  empty: { alignItems: 'center', gap: 8, paddingTop: 60 },
+  emptyTitle: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  emptyText: { color: 'rgba(235,235,245,0.5)', fontSize: 13 },
+
+  itemRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  courseTitle: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  badgeRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  badge: {
+    backgroundColor: 'rgba(52,120,246,0.2)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 8,
+  },
+  badgeText: { color: '#3478f6', fontSize: 11, fontWeight: '600' },
+
+  checkinButton: {
+    backgroundColor: '#3478f6',
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 8,
+  },
+  checkinButtonText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+
+  toastWrap: {
+    position: 'absolute',
+    bottom: 100,
+    left: 0,
+    right: 0,
     alignItems: 'center',
   },
-  buttonPressed: { opacity: 0.7 },
-  buttonDisabled: { backgroundColor: '#555' },
-  buttonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
-  muted: { color: '#888', fontSize: 13, marginTop: 4 },
-  resultText: { fontSize: 14, fontWeight: '600', marginTop: 6 },
-  ok: { color: '#34d399' },
-  warn: { color: '#fbbf24' },
-  err: { color: '#f87171' },
-  preview: {
-    color: '#bbb',
-    fontSize: 12,
-    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
-    marginTop: 6,
-  },
-  scannerBox: {
-    height: 280,
-    borderRadius: 12,
-    overflow: 'hidden',
-    backgroundColor: '#000',
-  },
-  scannerFallback: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
-  },
-  scannerFallbackText: { color: '#fff', fontSize: 15, fontWeight: '600' },
-  scannerFallbackHint: { color: '#999', fontSize: 12, marginTop: 6 },
 });
