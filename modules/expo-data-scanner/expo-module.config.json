@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["ExpoDataScannerModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.datascanner.ExpoDataScannerModule"]
+  }
+}

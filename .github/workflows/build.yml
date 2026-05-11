@@ -1,0 +1,276 @@
+name: Build (iOS + Android + Web)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Shared version computation
+  # ─────────────────────────────────────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      short: ${{ steps.v.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          echo "tag=build-${COUNT}" >> $GITHUB_OUTPUT
+          echo "version=1.0.${COUNT}" >> $GITHUB_OUTPUT
+          echo "short=${SHORT}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────
+  # iOS unsigned IPA  (LiveContainer-compatible)
+  # ─────────────────────────────────────────────────────────────
+  ios:
+    needs: version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Patch app version
+        run: |
+          node -e "
+          const fs = require('fs');
+          const j = JSON.parse(fs.readFileSync('app.json','utf8'));
+          j.expo.version = '${{ needs.version.outputs.version }}';
+          j.expo.ios = j.expo.ios || {};
+          j.expo.ios.buildNumber = '${{ needs.version.outputs.version }}';
+          j.expo.android = j.expo.android || {};
+          j.expo.android.versionCode = ${{ github.run_number }};
+          fs.writeFileSync('app.json', JSON.stringify(j, null, 2));
+          "
+
+      - name: Expo prebuild (iOS)
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install Pods
+        working-directory: ios
+        run: pod install --repo-update
+
+      - name: Build unsigned .app
+        run: |
+          xcodebuild \
+            -workspace ios/CQUPTRollcall.xcworkspace \
+            -scheme CQUPTRollcall \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            ENABLE_BITCODE=NO \
+            -allowProvisioningUpdates \
+            build
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find build -name "*.app" -path "*/Release-iphoneos/*" -maxdepth 6 | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app produced"; exit 1
+          fi
+          echo "Found app: $APP_PATH"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -qr CQUPTRollcall.ipa Payload
+          ls -lh CQUPTRollcall.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: CQUPTRollcall.ipa
+
+  # ─────────────────────────────────────────────────────────────
+  # Android APK (release, unsigned debug-signed)
+  # ─────────────────────────────────────────────────────────────
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Patch app version
+        run: |
+          node -e "
+          const fs = require('fs');
+          const j = JSON.parse(fs.readFileSync('app.json','utf8'));
+          j.expo.version = '${{ needs.version.outputs.version }}';
+          j.expo.android = j.expo.android || {};
+          j.expo.android.versionCode = ${{ github.run_number }};
+          fs.writeFileSync('app.json', JSON.stringify(j, null, 2));
+          "
+
+      - name: Expo prebuild (Android)
+        run: npx expo prebuild --platform android --clean
+
+      - name: Build release APK (debug-signed for sideload)
+        working-directory: android
+        run: ./gradlew assembleRelease -x lint
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then echo "::error::no APK"; exit 1; fi
+          cp "$APK" CQUPTRollcall.apk
+          ls -lh CQUPTRollcall.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: CQUPTRollcall.apk
+
+  # ─────────────────────────────────────────────────────────────
+  # Web static export
+  # ─────────────────────────────────────────────────────────────
+  web:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build web bundle
+        run: npx expo export --platform web
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: dist
+
+  # ─────────────────────────────────────────────────────────────
+  # Release: GitHub Release with IPA + APK + source.json + icon
+  # ─────────────────────────────────────────────────────────────
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [version, ios, android, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: ios-ipa, path: . }
+      - uses: actions/download-artifact@v4
+        with: { name: android-apk, path: . }
+
+      - name: Generate source.json (AltStore / SideStore source)
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          TAG="${{ needs.version.outputs.tag }}"
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          IPA_SIZE=$(stat -c%s CQUPTRollcall.ipa)
+          REPO="${{ github.repository }}"
+
+          python3 -c "
+          import json, os
+          source = {
+            'name': 'CQUPT Rollcall (RN)',
+            'subtitle': '重邮自动签到',
+            'description': '重庆邮电大学自动签到 React Native 客户端，支持 iOS/Android/Web。',
+            'iconURL': f'https://github.com/{os.environ[\"REPO\"]}/releases/download/{os.environ[\"TAG\"]}/icon.png',
+            'apps': [{
+              'name': 'CQUPT签到',
+              'bundleIdentifier': 'com.cqupt.rollcall.CQUPTRollcall',
+              'developerName': 'Auto-CQUPT-Plan',
+              'subtitle': '重邮自动签到',
+              'localizedDescription': '重庆邮电大学自动签到。React Native + 原生 VisionKit 扫码 + iOS 26 Liquid Glass。',
+              'iconURL': f'https://github.com/{os.environ[\"REPO\"]}/releases/download/{os.environ[\"TAG\"]}/icon.png',
+              'tintColor': '007AFF',
+              'versions': [{
+                'version': os.environ['VERSION'],
+                'date': os.environ['DATE'],
+                'localizedDescription': f'{os.environ[\"VERSION\"]} ({os.environ[\"TAG\"]})',
+                'downloadURL': f'https://github.com/{os.environ[\"REPO\"]}/releases/download/{os.environ[\"TAG\"]}/CQUPTRollcall.ipa',
+                'size': int(os.environ['IPA_SIZE'])
+              }],
+              'appPermissions': {
+                'entitlements': [],
+                'privacy': {
+                  'NSCameraUsageDescription': '需要使用相机扫描签到二维码'
+                }
+              }
+            }],
+            'news': []
+          }
+          print(json.dumps(source, indent=2, ensure_ascii=False))
+          " > source.json
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+
+      - name: Copy icon if present
+        run: |
+          if [ -f assets/images/icon.png ]; then
+            cp assets/images/icon.png icon.png
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.version }} (${{ needs.version.outputs.short }})
+          files: |
+            CQUPTRollcall.ipa
+            CQUPTRollcall.apk
+            source.json
+            icon.png
+          make_latest: true
+          fail_on_unmatched_files: false
+
+  # ─────────────────────────────────────────────────────────────
+  # Pages: deploy web preview
+  # ─────────────────────────────────────────────────────────────
+  pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: web
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: web-dist, path: dist }
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: dist }
+      - id: deployment
+        uses: actions/deploy-pages@v4
